@@ -29,6 +29,24 @@ from ..themes import classify_theme
 FEE_RATE = 0.029
 FEE_FIXED = 0.30
 
+# Two syncs at once (dashboard button vs launchd vs Refresh Now.command) contend
+# on the same upserts, and Supabase's 2min statement_timeout then kills the loser
+# mid-run. This lock is session-scoped: it releases on close AND on crash/kill,
+# so a dead run can never wedge the next one out.
+NIGHTLY_LOCK_KEY = 0x74736869  # 'tshi'
+
+# Stage labels, in the order main() runs them, for the dashboard's live banner.
+_STAGES = (
+    "shopify products",
+    "payment fees",
+    "shopify orders",
+    "printify products",
+    "printify orders",
+    "allocating costs",
+    "meta ad-sets",
+    "meta ad-set days",
+)
+
 _SHOPIFY_STATUS_TO_FUNNEL = {
     "ACTIVE": "winner",
     "DRAFT": "staged",
@@ -47,6 +65,22 @@ def _money(node: dict | None) -> float:
         return float(node["shopMoney"]["amount"])
     except (KeyError, TypeError, ValueError):
         return 0.0
+
+
+def _progress(conn: psycopg.Connection, run_id: int | None, stage: int) -> None:
+    """Record the stage about to run, so the dashboard can show live progress."""
+    if run_id is None:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "update sync_runs set detail = coalesce(detail, '{}'::jsonb) || %s where id = %s",
+            (
+                Jsonb({"stage": stage, "stage_name": _STAGES[stage - 1],
+                       "stages_total": len(_STAGES)}),
+                run_id,
+            ),
+        )
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +448,15 @@ def main() -> int:
     conn = connect(cfg)
     run_id = None
     try:
+        # Claim the sync slot before recording a run, so a rejected attempt
+        # leaves no trace in sync_runs.
+        with conn.cursor() as cur:
+            cur.execute("select pg_try_advisory_lock(%s)", (NIGHTLY_LOCK_KEY,))
+            if not cur.fetchone()[0]:
+                print("Another sync is already running — exiting without changes.")
+                return 2
+        conn.commit()
+
         with conn.cursor() as cur:
             cur.execute(
                 "insert into sync_runs (status, detail) values ('running', %s) returning id",
@@ -426,22 +469,30 @@ def main() -> int:
         printify = PrintifyClient(cfg)
         meta = MetaClient(cfg)
 
+        _progress(conn, run_id, 1)
         n_products = sync_shopify_products(conn, shopify)
         print(f"  shopify products: {n_products}")
+        _progress(conn, run_id, 2)
         real_fees = fetch_real_fees(shopify, since)
         if real_fees is None:
             print("  payment fees:     ESTIMATE (add read_shopify_payments_payouts scope for real fees)")
         else:
             print(f"  payment fees:     REAL for {len(real_fees)} orders")
+        _progress(conn, run_id, 3)
         n_orders = sync_shopify_orders(conn, shopify, since, real_fees)
         print(f"  shopify orders:   {n_orders}")
+        _progress(conn, run_id, 4)
         n_pf_products = sync_printify_products(conn, printify)
         print(f"  printify products matched: {n_pf_products}")
+        _progress(conn, run_id, 5)
         n_pf_orders = sync_printify_orders(conn, printify)
         print(f"  printify orders:  {n_pf_orders}")
+        _progress(conn, run_id, 6)
         allocate_printify_cost(conn)
+        _progress(conn, run_id, 7)
         n_adsets = sync_meta_adsets(conn, meta)
         print(f"  meta ad-sets (status): {n_adsets}")
+        _progress(conn, run_id, 8)
         n_ads = sync_meta(conn, meta, since, until)
         print(f"  meta ad-set days: {n_ads}")
 

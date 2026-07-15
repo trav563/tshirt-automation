@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -17,7 +18,7 @@ import streamlit as st
 
 # Absolute imports: Streamlit runs this file as a top-level script (__main__),
 # so relative imports would fail. The `tshirt` package is installed (pip install -e .).
-from tshirt.config import Config
+from tshirt.config import PROJECT_ROOT, Config
 from tshirt.db.connection import connect
 from tshirt.jobs.recommend import ACTIONS, build_recommendations
 from tshirt.dashboard import queries
@@ -40,6 +41,103 @@ def _recommendations(since: str) -> pd.DataFrame:
     with connect(cfg) as conn:
         recos = build_recommendations(conn, cfg, since)
     return pd.DataFrame([r.__dict__ for r in recos])
+
+
+# The pull takes ~10-15 minutes, so it runs detached instead of blocking the
+# page. sync_runs is the only channel back: the job records its stage there and
+# the banner below polls it.
+_PULL_GRACE_SECONDS = 20  # covers the gap between spawning and the job's first row
+
+
+def _start_pull() -> None:
+    """Spawn the nightly job detached, so it outlives this tab and this server."""
+    log_path = PROJECT_ROOT / "data" / "pull.log"
+    log_path.parent.mkdir(exist_ok=True)
+    # The child gets its own dup of the fd; closing ours here is correct.
+    # It's the only trail if the job dies before writing its sync_runs row.
+    with open(log_path, "a") as log:
+        st.session_state["_pull_proc"] = subprocess.Popen(
+            [str(Path(sys.executable).parent / "tshirt-nightly")],
+            stdout=log, stderr=log, start_new_session=True,
+        )
+    st.session_state["_pull_started_at"] = time.time()
+    st.rerun()
+
+
+def _pull_just_clicked() -> bool:
+    started = st.session_state.get("_pull_started_at")
+    return started is not None and (time.time() - started) < _PULL_GRACE_SECONDS
+
+
+def _elapsed(started_at) -> str:
+    if started_at is None:
+        return "0s"
+    start = pd.Timestamp(started_at)
+    now = pd.Timestamp.now(tz=start.tz) if start.tz is not None else pd.Timestamp.now()
+    secs = max(0, int((now - start).total_seconds()))
+    return f"{secs // 60}m {secs % 60}s" if secs >= 60 else f"{secs}s"
+
+
+def _sync_status() -> None:
+    """Live banner while a sync runs, otherwise an honest account of the last one."""
+    run = queries.live_sync()
+    if (run and run["status"] == "running") or _pull_just_clicked():
+        _sync_banner()
+        return
+    _pull_exit_note()
+    _sync_caption(run)
+
+
+@st.fragment(run_every=5)
+def _sync_banner() -> None:
+    """Polls sync_runs every 5s. Only called while a run is live, so an idle
+    dashboard opens no extra connections."""
+    run = queries.live_sync()
+    if run and run["status"] == "running":
+        detail = run["detail"] or {}
+        stage, total = detail.get("stage"), detail.get("stages_total")
+        if stage and total:
+            st.progress(stage / total, text=f"Stage {stage}/{total}: {detail.get('stage_name', '')}")
+        else:
+            st.progress(0.0, text="Starting…")
+        st.caption(f"Syncing… {_elapsed(run['started_at'])} elapsed. Safe to close this tab.")
+        return
+    if _pull_just_clicked():
+        st.progress(0.0, text="Starting…")
+        return
+    # The run we were watching reached a terminal state: refresh the whole page
+    # so the numbers update and this fragment stops being called (polling stops).
+    st.session_state.pop("_pull_started_at", None)
+    st.cache_data.clear()
+    st.rerun(scope="app")
+
+
+def _pull_exit_note() -> None:
+    proc = st.session_state.get("_pull_proc")
+    code = proc.poll() if proc else None
+    if code in (None, 0):
+        return
+    if code == 2:
+        st.info("That pull was skipped — another sync was already running.")
+    else:
+        st.error(f"The pull failed to start (exit {code}). See data/pull.log.")
+
+
+def _sync_caption(run: dict | None) -> None:
+    if not run:
+        st.caption("No sync has run yet. Click “Pull latest data”.")
+        return
+    when = run["finished_at"] or run["started_at"]
+    if run["status"] == "ok":
+        st.caption(f"Last data pull: {when}")
+    elif run["status"] == "error":
+        st.warning(f"Last pull FAILED at {when} — the data below may be stale.")
+        err = (run["detail"] or {}).get("error")
+        if err:
+            with st.expander("Why it failed"):
+                st.code(str(err)[:800])
+    else:
+        st.caption(f"Last data pull: {when} ({run['status']})")
 
 
 def _gate() -> Config:
@@ -87,22 +185,11 @@ def main() -> None:
         st.cache_data.clear()
         st.rerun()
     if st.sidebar.button("⬇️ Pull latest data", use_container_width=True,
-                         help="Fetch new orders/ads from Shopify, Printify & Meta now (a few minutes)."):
-        with st.spinner("Pulling from Shopify, Printify & Meta... (a few minutes)"):
-            proc = subprocess.run(
-                [str(Path(sys.executable).parent / "tshirt-nightly")],
-                capture_output=True, text=True,
-            )
-        if proc.returncode == 0:
-            st.cache_data.clear()
-            st.sidebar.success("Data updated.")
-            st.rerun()
-        else:
-            st.sidebar.error("Pull failed:")
-            st.sidebar.code((proc.stderr or proc.stdout or "")[-800:])
-    sync = queries.last_sync()
-    if sync:
-        st.sidebar.caption(f"Last data pull: {sync['finished_at'] or sync['started_at']}")
+                         help="Fetch new orders/ads from Shopify, Printify & Meta. Takes ~10-15 "
+                              "minutes and runs in the background — keep using the dashboard."):
+        _start_pull()
+    with st.sidebar:
+        _sync_status()
     st.sidebar.caption("Set up the nightly auto-refresh so this stays current on its own (see README).")
 
     try:

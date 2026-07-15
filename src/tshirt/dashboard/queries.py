@@ -227,6 +227,18 @@ def niche_pnl(since: str, until: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def last_sync() -> dict | None:
+    return _latest_sync()
+
+
+def live_sync() -> dict | None:
+    """Uncached twin of last_sync(), for polling a run that is in progress.
+
+    last_sync() is cached for 5 minutes, which would freeze a progress banner.
+    """
+    return _latest_sync()
+
+
+def _latest_sync() -> dict | None:
     df = _df(
         "select started_at, finished_at, status, detail "
         "from sync_runs order by id desc limit 1"
@@ -234,7 +246,12 @@ def last_sync() -> dict | None:
     if df.empty:
         return None
     r = df.iloc[0]
-    return {"started_at": r["started_at"], "finished_at": r["finished_at"], "status": r["status"]}
+    return {
+        "started_at": r["started_at"],
+        "finished_at": r["finished_at"],
+        "status": r["status"],
+        "detail": r["detail"] or {},
+    }
 
 
 @st.cache_data(ttl=300)

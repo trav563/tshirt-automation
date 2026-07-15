@@ -113,17 +113,56 @@ Refresh Now.command        double-click to pull fresh data now
 opens the dashboard in your browser at `localhost:8501`. A small Terminal window
 stays open running the local server; close that window to quit the dashboard.
 
-- **Refresh data now:** double-click `Refresh Now.command`, or use the sidebar
-  "Refresh data" button (which just re-reads the DB; the nightly job is what pulls
-  new data).
+- **Reload** (sidebar): re-reads the DB. Does *not* pull from Shopify/Meta. Instant.
+- **Pull latest data** (sidebar): fetches new orders/ads from all three APIs.
+  **Takes ~10-15 minutes** — that is normal, it is not stuck. It runs in the
+  background, so you can keep using the dashboard, close the tab, or even quit
+  the server; the sidebar shows a live stage-by-stage progress bar while it runs.
+  Output is logged to `data/pull.log`. Double-click `Refresh Now.command` to do
+  the same thing from Finder.
+- Only one sync can run at a time. A second one exits immediately rather than
+  running concurrently — two at once corrupt each other's writes (they contend on
+  the same upserts and Postgres kills the loser on its 2-minute statement timeout).
 - **AI design ideas:** set `ANTHROPIC_API_KEY` in `.env`, then press "Generate
   ideas from my winners". Uses `claude-opus-4-8`. Optional — the rest of the
   dashboard works without it.
 
 ## Scheduling (nightly auto-refresh)
 
-A `launchd` agent runs the pull + recommend each night (~4:10am), so the
-dashboard is always current. One-time install:
+> **Currently broken — known issue.** The `launchd` agent is installed and fires
+> at 4:10am, but every run fails instantly with exit code 126 and
+> `data/nightly.log` fills with:
+>
+> ```
+> /bin/bash: .../deploy/run_nightly.sh: Operation not permitted
+> ```
+>
+> **Cause:** macOS TCC blocks launchd-spawned processes from reading anything
+> under `~/Desktop`. It is not a permissions-bit or quarantine problem — `launchd`
+> itself is exempt (which is why it can still write the log), but the `bash` it
+> spawns is not, so it cannot even open the script. `.env`, `.venv/`, and `src/`
+> are all inside the same fence, so pointing the plist directly at the venv
+> binary does not help either.
+>
+> **The fix is to move the project off the Desktop** (e.g. to
+> `~/tshirt-automation`), then recreate the venv — shebangs are absolute, so a
+> plain `mv` leaves it broken:
+>
+> ```bash
+> mv ~/Desktop/tshirt-automation ~/tshirt-automation
+> cd ~/tshirt-automation && rm -rf .venv
+> python3 -m venv .venv && .venv/bin/pip install -e .
+> ```
+>
+> Then update the paths in `deploy/com.trendytshirt.nightly.plist` and reinstall
+> it. Granting Full Disk Access to `/bin/bash` also works but is a bad trade: it
+> gives *every* launchd-spawned shell access to Mail, Messages and Safari, and the
+> grant is keyed to the binary's signature, so an OS update silently re-breaks it.
+>
+> **Until then, use the sidebar "Pull latest data" button** — the data only
+> refreshes when you ask it to.
+
+Install (one time):
 
 ```bash
 cp deploy/com.trendytshirt.nightly.plist ~/Library/LaunchAgents/
