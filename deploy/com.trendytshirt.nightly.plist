@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Nightly auto-refresh via launchd. Install (one time):
+
+    cp deploy/com.trendytshirt.nightly.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.trendytshirt.nightly.plist
+
+  Trigger immediately to test:  launchctl start com.trendytshirt.nightly
+  Stop scheduling:              launchctl unload ~/Library/LaunchAgents/com.trendytshirt.nightly.plist
+
+  NOTE: update the two paths below if the project does not live at
+  /Users/travisames/Desktop/tshirt-automation.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.trendytshirt.nightly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/travisames/Desktop/tshirt-automation/deploy/run_nightly.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>4</integer>
+        <key>Minute</key><integer>10</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/travisames/Desktop/tshirt-automation/data/nightly.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/travisames/Desktop/tshirt-automation/data/nightly.log</string>
+</dict>
+</plist>
