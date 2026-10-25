@@ -31,7 +31,8 @@ from tabulate import tabulate
 from ..config import PROJECT_ROOT, Config
 from ..db.connection import connect
 
-# Payment/Shopify fee, mirrors jobs/nightly.py.
+# Payment/Shopify fee, mirrors jobs/nightly.py. Last-resort fallback only: the
+# real per-order fee comes from orders.fee (Shopify Payments balance transactions).
 FEE_RATE = 0.029
 FEE_FIXED = 0.30
 
@@ -54,7 +55,7 @@ class AdSetReco:
     spend: float
     clicks: int
     purchases: int
-    revenue: float          # Meta pixel-attributed purchase value
+    revenue: float          # real Shopify revenue when attributed, else Meta's pixel value
     order_cogs: float       # realized cost of an average order, not of one shirt
     cogs: float
     fees: float
@@ -64,11 +65,12 @@ class AdSetReco:
     action: str
     reason: str
     effective_status: str | None = None
+    attribution: str = "meta"   # "shopify" = this ad set's own tagged orders
 
 
-def _break_even_roas(order_cogs: float, order_value: float) -> float:
+def _break_even_roas(order_cogs: float, order_value: float, order_fee: float) -> float:
     """ROAS at which an order's contribution exactly covers ad spend."""
-    contribution = order_value - order_cogs - (order_value * FEE_RATE + FEE_FIXED)
+    contribution = order_value - order_cogs - order_fee
     if contribution <= 0:
         return float("inf")
     return round(order_value / contribution, 2)
@@ -118,13 +120,16 @@ def _adset_rows(conn: psycopg.Connection, since: str) -> list[dict]:
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def _real_order_economics(conn: psycopg.Connection, since: str) -> tuple[float | None, float | None, dict]:
-    """Derive true per-order cost and value from actual orders in the window.
+def _real_order_economics(
+    conn: psycopg.Connection, since: str
+) -> tuple[float | None, float | None, float | None, dict]:
+    """Derive true per-order cost, value and fee from actual orders in the window.
 
     Meta reports one purchase per ORDER, so every figure here is per order:
     order cost = realized Printify cost (production + shipping + tax) per order;
-    order value = realized revenue (product + shipping) per order. Returns the
-    account-blended values plus a per-shirt map, all from real data.
+    order value = realized revenue (product + shipping) per order; order fee =
+    the real Shopify Payments fee per order. Returns the account-blended values
+    plus a per-shirt map, all from real data.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -132,6 +137,7 @@ def _real_order_economics(conn: psycopg.Connection, since: str) -> tuple[float |
             select coalesce(li.shirt_id, li.shopify_product_id) as shirt_id,
                    sum(coalesce(li.printify_cost,0))                     as cost,
                    sum(li.revenue)                                       as rev,
+                   sum(coalesce(li.fee,0))                               as fee,
                    count(distinct li.shopify_order_id)                   as orders
             from order_line_items li
             join orders o on o.shopify_order_id = li.shopify_order_id
@@ -148,6 +154,7 @@ def _real_order_economics(conn: psycopg.Connection, since: str) -> tuple[float |
             """
             select sum(coalesce(li.printify_cost,0)),
                    sum(li.revenue),
+                   sum(coalesce(li.fee,0)),
                    count(distinct li.shopify_order_id)
             from order_line_items li
             join orders o on o.shopify_order_id = li.shopify_order_id
@@ -155,45 +162,94 @@ def _real_order_economics(conn: psycopg.Connection, since: str) -> tuple[float |
             """,
             (since,),
         )
-        tot_cost, tot_rev, tot_orders = cur.fetchone()
+        tot_cost, tot_rev, tot_fee, tot_orders = cur.fetchone()
 
-    per_shirt: dict[str, tuple[float, float]] = {}
-    for shirt_id, cost, rev, orders in rows:
-        cost, rev, orders = float(cost or 0), float(rev or 0), int(orders or 0)
+    per_shirt: dict[str, tuple[float, float, float]] = {}
+    for shirt_id, cost, rev, fee, orders in rows:
+        cost, rev, fee = float(cost or 0), float(rev or 0), float(fee or 0)
+        orders = int(orders or 0)
         if orders > 0:
-            per_shirt[str(shirt_id)] = (round(cost / orders, 2), round(rev / orders, 2))
-    tot_cost, tot_rev = float(tot_cost or 0), float(tot_rev or 0)
+            per_shirt[str(shirt_id)] = (round(cost / orders, 2), round(rev / orders, 2),
+                                        round(fee / orders, 2))
+    tot_cost, tot_rev, tot_fee = float(tot_cost or 0), float(tot_rev or 0), float(tot_fee or 0)
     tot_orders = int(tot_orders or 0)
     blended_cogs = round(tot_cost / tot_orders, 2) if tot_orders else None
     blended_price = round(tot_rev / tot_orders, 2) if tot_orders else None
-    return blended_cogs, blended_price, per_shirt
+    blended_fee = round(tot_fee / tot_orders, 2) if tot_orders else None
+    return blended_cogs, blended_price, blended_fee, per_shirt
+
+
+def _shopify_by_adset(conn: psycopg.Connection, since: str) -> dict[str, dict]:
+    """Real orders, revenue, cost and fees per ad set, credited by Meta's utm_term.
+
+    Meta's dynamic URL tags put the ad set id in utm_term, so this is what an ad
+    set actually sold rather than what the pixel claims it sold.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select o.utm_term                                   as adset_id,
+                   count(distinct o.shopify_order_id)           as orders,
+                   sum(li.revenue)                              as revenue,
+                   sum(coalesce(li.printify_cost,0))            as cogs,
+                   sum(coalesce(li.fee,0))                      as fees
+            from orders o
+            join order_line_items li on li.shopify_order_id = o.shopify_order_id
+            where o.created_at >= %s and o.utm_term is not null
+            group by 1
+            """,
+            (since,),
+        )
+        return {
+            str(adset_id): {"orders": int(orders), "revenue": float(rev or 0),
+                            "cogs": float(cogs or 0), "fees": float(fees or 0)}
+            for adset_id, orders, rev, cogs, fees in cur.fetchall()
+        }
 
 
 def build_recommendations(conn: psycopg.Connection, cfg: Config, since: str) -> list[AdSetReco]:
     # Real per-order economics from actual orders; cfg defaults are last resort only.
-    blended_cogs, blended_price, per_shirt = _real_order_economics(conn, since)
+    blended_cogs, blended_price, blended_fee, per_shirt = _real_order_economics(conn, since)
     blended_cogs = blended_cogs if blended_cogs is not None else cfg.default_unit_cogs
     blended_price = blended_price if blended_price is not None else cfg.default_price
+    if blended_fee is None:
+        blended_fee = round(blended_price * FEE_RATE + FEE_FIXED, 2)
+    attributed = _shopify_by_adset(conn, since)
 
     out: list[AdSetReco] = []
     for r in _adset_rows(conn, since):
-        sid = str(r["shirt_id"]) if r["shirt_id"] else None
-        if sid and sid in per_shirt:
-            order_cogs, order_value = per_shirt[sid]   # this shirt's real per-order economics
-        else:
-            order_cogs, order_value = blended_cogs, blended_price  # real account-blended economics
         spend = float(r["spend"] or 0)
         clicks = int(r["clicks"] or 0)
-        purchases = int(r["purchases"] or 0)
-        revenue = float(r["revenue"] or 0)
-
-        # purchases counts Meta ORDERS, so the cost per purchase must be per order.
-        cogs = round(order_cogs * purchases, 2)
-        fees = round(revenue * FEE_RATE + purchases * FEE_FIXED, 2)
+        real = attributed.get(str(r["meta_ad_set_id"]))
+        if real:
+            # Ground truth: the orders this ad set's own utm_term actually brought in.
+            attribution = "shopify"
+            purchases = real["orders"]
+            revenue = round(real["revenue"], 2)
+            cogs = round(real["cogs"], 2)
+            fees = round(real["fees"], 2)
+            order_cogs = round(cogs / purchases, 2)
+            order_value = round(revenue / purchases, 2)
+            order_fee = round(fees / purchases, 2)
+        else:
+            # Nothing tagged to this ad set: fall back to Meta's pixel count priced
+            # at blended economics. purchases counts ORDERS, so the rates are per order.
+            attribution = "meta"
+            purchases = int(r["purchases"] or 0)
+            revenue = float(r["revenue"] or 0)
+            sid = str(r["shirt_id"]) if r["shirt_id"] else None
+            if sid and sid in per_shirt:
+                order_cogs, order_value, order_fee = per_shirt[sid]
+            else:
+                order_cogs, order_value, order_fee = blended_cogs, blended_price, blended_fee
+            cogs = round(order_cogs * purchases, 2)
+            fees = round(order_fee * purchases, 2)
         profit = round(revenue - cogs - fees - spend, 2)
         roas = round(revenue / spend, 2) if spend > 0 else None
-        break_even = _break_even_roas(order_cogs, order_value)
+        break_even = _break_even_roas(order_cogs, order_value, order_fee)
         action, reason = _classify(spend, clicks, purchases, profit, roas, break_even)
+        if attribution == "meta" and purchases:
+            reason += " (meta-estimated: no tagged orders)"
 
         # An ad set that isn't live needs no scale/hold/kill action — it's already off.
         eff = r.get("effective_status")
@@ -209,7 +265,7 @@ def build_recommendations(conn: psycopg.Connection, cfg: Config, since: str) -> 
                 clicks=clicks, purchases=purchases, revenue=round(revenue, 2),
                 order_cogs=round(order_cogs, 2), cogs=cogs, fees=fees, profit=profit,
                 roas=roas, break_even_roas=break_even, action=action, reason=reason,
-                effective_status=eff,
+                effective_status=eff, attribution=attribution,
             )
         )
     # Sort by action priority, then by money at stake.
@@ -264,9 +320,9 @@ def _markdown(recos: list[AdSetReco], summary: dict, since: str, until: str) -> 
         f"- Meta-reported revenue: ${summary['meta_revenue']:.2f} "
         f"(pixel ROAS {summary['meta_roas'] if summary['meta_roas'] is not None else 'n/a'})",
         "",
-        "> MER is blended (all revenue vs all ad spend). Per-ad-set numbers below use "
-        "Meta's pixel attribution; they get exact once ad URLs carry "
-        "`utm_campaign=shirt_<id>`.",
+        "> MER is blended (all revenue vs all ad spend). Per-ad-set numbers below come "
+        "from the orders each ad set's `utm_term` actually brought in; rows marked "
+        "meta-estimated had no tagged orders and fall back to pixel attribution.",
         "",
     ]
     for action in ACTIONS:

@@ -168,8 +168,8 @@ def sync_shopify_orders(
                 insert into orders (shopify_order_id, name, created_at, currency,
                     subtotal, total_discounts, total_price, shipping_revenue,
                     net_revenue, refunds, total_tax, fee,
-                    utm_campaign, utm_source, utm_medium, raw)
-                values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    utm_campaign, utm_source, utm_medium, utm_content, utm_term, raw)
+                values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 on conflict (shopify_order_id) do update set
                     total_price = excluded.total_price,
                     subtotal = excluded.subtotal,
@@ -182,6 +182,8 @@ def sync_shopify_orders(
                     utm_campaign = excluded.utm_campaign,
                     utm_source = excluded.utm_source,
                     utm_medium = excluded.utm_medium,
+                    utm_content = excluded.utm_content,
+                    utm_term = excluded.utm_term,
                     raw = excluded.raw
                 """,
                 (
@@ -189,7 +191,8 @@ def sync_shopify_orders(
                     _money(o.get("currentSubtotalPriceSet")),
                     _money(o.get("totalDiscountsSet")), total, shipping_rev,
                     net_revenue, refunds, tax, fee,
-                    utm.get("campaign"), utm.get("source"), utm.get("medium"), Jsonb(o),
+                    utm.get("campaign"), utm.get("source"), utm.get("medium"),
+                    utm.get("content"), utm.get("term"), Jsonb(o),
                 ),
             )
 

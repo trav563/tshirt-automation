@@ -65,6 +65,11 @@ alter table orders add column if not exists shipping_revenue numeric(10, 2);
 alter table orders add column if not exists net_revenue numeric(10, 2);   -- netPayment - tax (after refunds)
 alter table orders add column if not exists refunds numeric(10, 2);       -- total refunded to customer
 alter table orders add column if not exists total_tax numeric(10, 2);     -- sales tax collected (pass-through)
+-- Meta's dynamic URL tags: utm_term is the ad set id and utm_content the ad id,
+-- which is what lets an order be credited to the ad set that actually sold it.
+alter table orders add column if not exists utm_content text;             -- Meta ad id
+alter table orders add column if not exists utm_term text;                -- Meta ad set id
+create index if not exists idx_orders_utm_term on orders (utm_term);
 alter table order_line_items add column if not exists shipping_revenue numeric(10, 2);
 
 -- ---------------------------------------------------------------------------

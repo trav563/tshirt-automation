@@ -49,7 +49,7 @@ query($cursor: String, $q: String) {
       totalRefundedSet { shopMoney { amount } }
       netPaymentSet { shopMoney { amount } }
       customerJourneySummary {
-        lastVisit { utmParameters { campaign source medium } }
+        lastVisit { utmParameters { campaign source medium content term } }
       }
       lineItems(first: 50) {
         nodes {
