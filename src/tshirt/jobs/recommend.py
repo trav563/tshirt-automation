@@ -9,12 +9,14 @@ Run after `tshirt-nightly`:
 
 Output: a ranked terminal table and a dated data/recommendations-YYYY-MM-DD.md.
 
-Profitability uses each shirt's REAL realized per-unit economics from actual
-orders: unit cost = Printify production + shipping + tax per unit, unit price =
-product + customer-paid shipping per unit. When an ad set is mapped to a shirt
+Profitability uses REAL realized PER-ORDER economics from actual orders, because
+Meta counts one "purchase" per order, not one per shirt: order cost = Printify
+production + shipping + tax per order, order value = product + customer-paid
+shipping per order. An order holds more than one shirt on average, so per-unit
+figures would undercharge COGS on every order. When an ad set is mapped to a shirt
 (via utm_campaign=shirt_<id>) it uses that shirt's numbers; otherwise it uses the
 account-blended real numbers. DEFAULT_UNIT_COGS / DEFAULT_PRICE are used only as a
-last resort when there is no order history at all.
+last resort when there is no order history at all, and assume one shirt per order.
 """
 
 from __future__ import annotations
@@ -53,7 +55,7 @@ class AdSetReco:
     clicks: int
     purchases: int
     revenue: float          # Meta pixel-attributed purchase value
-    unit_cogs: float
+    order_cogs: float       # realized cost of an average order, not of one shirt
     cogs: float
     fees: float
     profit: float
@@ -64,12 +66,12 @@ class AdSetReco:
     effective_status: str | None = None
 
 
-def _break_even_roas(unit_cogs: float, price: float) -> float:
+def _break_even_roas(order_cogs: float, order_value: float) -> float:
     """ROAS at which an order's contribution exactly covers ad spend."""
-    contribution = price - unit_cogs - (price * FEE_RATE + FEE_FIXED)
+    contribution = order_value - order_cogs - (order_value * FEE_RATE + FEE_FIXED)
     if contribution <= 0:
         return float("inf")
-    return round(price / contribution, 2)
+    return round(order_value / contribution, 2)
 
 
 def _classify(spend: float, clicks: int, purchases: int, profit: float,
@@ -116,11 +118,12 @@ def _adset_rows(conn: psycopg.Connection, since: str) -> list[dict]:
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def _real_unit_economics(conn: psycopg.Connection, since: str) -> tuple[float | None, float | None, dict]:
-    """Derive true per-unit cost and price from actual orders in the window.
+def _real_order_economics(conn: psycopg.Connection, since: str) -> tuple[float | None, float | None, dict]:
+    """Derive true per-order cost and value from actual orders in the window.
 
-    unit cost = realized Printify cost (production + shipping + tax) per unit;
-    unit price = realized revenue (product + shipping) per unit. Returns the
+    Meta reports one purchase per ORDER, so every figure here is per order:
+    order cost = realized Printify cost (production + shipping + tax) per order;
+    order value = realized revenue (product + shipping) per order. Returns the
     account-blended values plus a per-shirt map, all from real data.
     """
     with conn.cursor() as cur:
@@ -129,34 +132,46 @@ def _real_unit_economics(conn: psycopg.Connection, since: str) -> tuple[float | 
             select coalesce(li.shirt_id, li.shopify_product_id) as shirt_id,
                    sum(coalesce(li.printify_cost,0))                     as cost,
                    sum(li.revenue)                                       as rev,
-                   sum(li.quantity)                                      as units
+                   count(distinct li.shopify_order_id)                   as orders
             from order_line_items li
             join orders o on o.shopify_order_id = li.shopify_order_id
             where o.created_at >= %s
             group by 1
-            having sum(li.quantity) > 0
             """,
             (since,),
         )
         rows = cur.fetchall()
 
+        # The blended figures need DISTINCT orders over the whole window: summing
+        # the per-shirt counts above would count an order once per shirt in it.
+        cur.execute(
+            """
+            select sum(coalesce(li.printify_cost,0)),
+                   sum(li.revenue),
+                   count(distinct li.shopify_order_id)
+            from order_line_items li
+            join orders o on o.shopify_order_id = li.shopify_order_id
+            where o.created_at >= %s
+            """,
+            (since,),
+        )
+        tot_cost, tot_rev, tot_orders = cur.fetchone()
+
     per_shirt: dict[str, tuple[float, float]] = {}
-    tot_cost = tot_rev = tot_units = 0.0
-    for shirt_id, cost, rev, units in rows:
-        cost, rev, units = float(cost or 0), float(rev or 0), float(units or 0)
-        if units > 0:
-            per_shirt[str(shirt_id)] = (round(cost / units, 2), round(rev / units, 2))
-            tot_cost += cost
-            tot_rev += rev
-            tot_units += units
-    blended_cogs = round(tot_cost / tot_units, 2) if tot_units else None
-    blended_price = round(tot_rev / tot_units, 2) if tot_units else None
+    for shirt_id, cost, rev, orders in rows:
+        cost, rev, orders = float(cost or 0), float(rev or 0), int(orders or 0)
+        if orders > 0:
+            per_shirt[str(shirt_id)] = (round(cost / orders, 2), round(rev / orders, 2))
+    tot_cost, tot_rev = float(tot_cost or 0), float(tot_rev or 0)
+    tot_orders = int(tot_orders or 0)
+    blended_cogs = round(tot_cost / tot_orders, 2) if tot_orders else None
+    blended_price = round(tot_rev / tot_orders, 2) if tot_orders else None
     return blended_cogs, blended_price, per_shirt
 
 
 def build_recommendations(conn: psycopg.Connection, cfg: Config, since: str) -> list[AdSetReco]:
-    # Real per-unit economics from actual orders; cfg defaults are last resort only.
-    blended_cogs, blended_price, per_shirt = _real_unit_economics(conn, since)
+    # Real per-order economics from actual orders; cfg defaults are last resort only.
+    blended_cogs, blended_price, per_shirt = _real_order_economics(conn, since)
     blended_cogs = blended_cogs if blended_cogs is not None else cfg.default_unit_cogs
     blended_price = blended_price if blended_price is not None else cfg.default_price
 
@@ -164,19 +179,20 @@ def build_recommendations(conn: psycopg.Connection, cfg: Config, since: str) -> 
     for r in _adset_rows(conn, since):
         sid = str(r["shirt_id"]) if r["shirt_id"] else None
         if sid and sid in per_shirt:
-            unit_cogs, price = per_shirt[sid]     # this shirt's real per-unit economics
+            order_cogs, order_value = per_shirt[sid]   # this shirt's real per-order economics
         else:
-            unit_cogs, price = blended_cogs, blended_price  # real account-blended economics
+            order_cogs, order_value = blended_cogs, blended_price  # real account-blended economics
         spend = float(r["spend"] or 0)
         clicks = int(r["clicks"] or 0)
         purchases = int(r["purchases"] or 0)
         revenue = float(r["revenue"] or 0)
 
-        cogs = round(unit_cogs * purchases, 2)
+        # purchases counts Meta ORDERS, so the cost per purchase must be per order.
+        cogs = round(order_cogs * purchases, 2)
         fees = round(revenue * FEE_RATE + purchases * FEE_FIXED, 2)
         profit = round(revenue - cogs - fees - spend, 2)
         roas = round(revenue / spend, 2) if spend > 0 else None
-        break_even = _break_even_roas(unit_cogs, price)
+        break_even = _break_even_roas(order_cogs, order_value)
         action, reason = _classify(spend, clicks, purchases, profit, roas, break_even)
 
         # An ad set that isn't live needs no scale/hold/kill action — it's already off.
@@ -191,7 +207,7 @@ def build_recommendations(conn: psycopg.Connection, cfg: Config, since: str) -> 
                 adset_id=r["meta_ad_set_id"], shirt_id=r["shirt_id"],
                 title=r["title"], theme=r["theme"], spend=round(spend, 2),
                 clicks=clicks, purchases=purchases, revenue=round(revenue, 2),
-                unit_cogs=round(unit_cogs, 2), cogs=cogs, fees=fees, profit=profit,
+                order_cogs=round(order_cogs, 2), cogs=cogs, fees=fees, profit=profit,
                 roas=roas, break_even_roas=break_even, action=action, reason=reason,
                 effective_status=eff,
             )
