@@ -202,6 +202,17 @@ def main() -> None:
     st.title("Profit & ad performance")
     st.caption(f"Window: {window_label}")
 
+    # Printify's history starts later than Shopify's, so a window reaching back
+    # before it shows revenue with no cost against it and overstates profit.
+    gap = queries.uncosted_revenue(since, until)
+    if gap["cost_data_starts"] and since < gap["cost_data_starts"]:
+        st.warning(
+            f"**Profit below is overstated for this window.** Printify cost data only "
+            f"starts {gap['cost_data_starts']}, so {gap['orders']:,} earlier orders carry "
+            f"${gap['revenue']:,.0f} of revenue with no cost against them. Start the window "
+            f"on {gap['cost_data_starts']} or later for a true profit figure."
+        )
+
     # --- HERO: true overall operating profit ---
     pnl = queries.operating_pnl(since, until)
     hero_left, hero_right = st.columns([1, 2])

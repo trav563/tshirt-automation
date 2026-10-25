@@ -274,6 +274,41 @@ def adset_launches(since: str, until: str, min_spend: float = 50.0) -> pd.DataFr
 
 
 @st.cache_data(ttl=300)
+@st.cache_data(ttl=300)
+def uncosted_revenue(since: str, until: str) -> dict:
+    """Revenue in the window from order lines with no Printify cost attached.
+
+    Printify's API returns no orders from before late 2024, so the older part of
+    the Shopify history carries revenue with no COGS against it and any profit
+    figure spanning it is overstated. The boundary is read from the data rather
+    than hardcoded, so it stays right as the history changes.
+    """
+    row = _df(
+        """
+        select coalesce(sum(li.revenue), 0)          as revenue,
+               count(distinct o.shopify_order_id)    as orders
+        from order_line_items li
+        join orders o on o.shopify_order_id = li.shopify_order_id
+        where o.created_at >= %s and o.created_at::date <= %s
+          and coalesce(li.printify_cost, 0) = 0
+        """,
+        (since, until),
+    ).iloc[0]
+    starts = _df(
+        """
+        select min(o.created_at)::date d
+        from order_line_items li
+        join orders o on o.shopify_order_id = li.shopify_order_id
+        where coalesce(li.printify_cost, 0) > 0
+        """
+    ).iloc[0]["d"]
+    return {
+        "revenue": float(row["revenue"]),
+        "orders": int(row["orders"]),
+        "cost_data_starts": str(starts) if starts is not None else None,
+    }
+
+
 def earliest_order_date() -> str:
     df = _df("select min(created_at)::date d from orders")
     val = df.iloc[0]["d"] if not df.empty else None
